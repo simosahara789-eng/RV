@@ -134,11 +134,17 @@ else:
         status_placeholder = st.empty()
         table_placeholder = st.empty()
 
-        results: list[ResultRow] = []
+        results: list[ResultRow] = [
+            ResultRow(source_url=source_url, status="pending", action="pending") for source_url in urls
+        ]
         total = len(urls)
 
         for idx, url in enumerate(urls, start=1):
             status_placeholder.info(f"Processing {idx}/{total}: {url}")
+            row = results[idx - 1]
+            row.status = "processing"
+            row.action = "processing"
+            table_placeholder.dataframe(results_to_dataframe(results), use_container_width=True)
 
             try:
                 extracted = extract_listing_data(url, api_client=client)
@@ -146,6 +152,7 @@ else:
                 if price is None:
                     raise ValueError("Sold price unavailable after HTML + API fallback; cannot calculate discounted draft price.")
                 discounted = apply_discount(price, discount_percent)
+                display_currency = extracted.price_currency or "USD"
 
                 title = sanitize_text(extracted.title, remove_special=remove_special, trim_length=160)
                 description = sanitize_text(
@@ -181,53 +188,33 @@ else:
                 if create_now:
                     success, _response_json, action_message = client.create_draft(payload)
                     if success:
-                        results.append(
-                            ResultRow(
-                                source_url=url,
-                                status="success",
-                                title=title,
-                                sold_price=f"{price} {extracted.price_currency}",
-                                discounted_price=f"{discounted} {extracted.price_currency}",
-                                action="draft created",
-                                warnings=" | ".join(warnings + ([action_message] if action_message else [])),
-                            )
-                        )
+                        row.status = "success"
+                        row.title = title
+                        row.sold_price = f"{price} {display_currency}"
+                        row.discounted_price = f"{discounted} {display_currency}"
+                        row.action = "draft created"
+                        row.warnings = " | ".join(warnings + ([action_message] if action_message else []))
                     else:
-                        results.append(
-                            ResultRow(
-                                source_url=url,
-                                status="failed",
-                                title=title,
-                                sold_price=f"{price} {extracted.price_currency}",
-                                discounted_price=f"{discounted} {extracted.price_currency}",
-                                action="failed",
-                                error=action_message,
-                                warnings=" | ".join(warnings),
-                            )
-                        )
+                        row.status = "failed"
+                        row.title = title
+                        row.sold_price = f"{price} {display_currency}"
+                        row.discounted_price = f"{discounted} {display_currency}"
+                        row.action = "failed"
+                        row.error = action_message
+                        row.warnings = " | ".join(warnings)
                 else:
-                    results.append(
-                        ResultRow(
-                            source_url=url,
-                            status="preview",
-                            title=title,
-                            sold_price=f"{price} {extracted.price_currency}",
-                            discounted_price=f"{discounted} {extracted.price_currency}",
-                            action="preview only",
-                            warnings=" | ".join(warnings),
-                        )
-                    )
+                    row.status = "preview"
+                    row.title = title
+                    row.sold_price = f"{price} {display_currency}"
+                    row.discounted_price = f"{discounted} {display_currency}"
+                    row.action = "preview only"
+                    row.warnings = " | ".join(warnings)
 
             except Exception as exc:
                 logger.exception("Failed processing URL: %s", url)
-                results.append(
-                    ResultRow(
-                        source_url=url,
-                        status="failed",
-                        action="failed",
-                        error=str(exc),
-                    )
-                )
+                row.status = "failed"
+                row.action = "failed"
+                row.error = str(exc)
 
             progress_bar.progress(idx / total)
             table_placeholder.dataframe(results_to_dataframe(results), use_container_width=True)
