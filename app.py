@@ -1,117 +1,245 @@
+"""Streamlit app for bulk Reverb draft creation from sold listing URLs."""
+
+from __future__ import annotations
+
+import os
+from decimal import Decimal
+
 import streamlit as st
-import requests
-import json
 
-API_BASE = "https://api.reverb.com/api"
+from parser import apply_discount, flatten_specs
+from reverb_api import ReverbAPIClient, condition_to_uuid
+from scraper import extract_listing_data
+from utils import (
+    ResultRow,
+    dataframe_to_csv_bytes,
+    parse_bulk_urls,
+    sanitize_text,
+    setup_logging,
+    results_to_dataframe,
+)
 
-# Official Reverb condition UUIDs from docs
-CONDITIONS = {
-    "Excellent": "df268ad1-c462-4ba6-b6db-e007e23922ea",
-    "Very Good": "ae4d9114-1bd7-4ec5-a4ba-6653af5ac84d",
-    "Good": "f7a3f48c-972a-44c6-b01a-0cd27488d3f6",
-    "Fair": "98777886-76d0-44c8-865e-bb40e669e934",
-    "Poor": "6a9dfcad-600b-46c8-9e08-ce6e5057921e",
-    "Mint": "ac5b9c1e-dc78-466d-b0b3-7cf712967a48",
-    "Brand New": "7c3f45de-2ae0-4c81-8400-fdb6b1d74890",
-}
+logger = setup_logging()
 
-st.set_page_config(page_title="Reverb Draft Creator", layout="centered")
-st.title("Reverb Draft Creator")
+st.set_page_config(page_title="Reverb Bulk Draft Creator", layout="wide")
+st.title("🎸 Reverb Bulk Draft Creator")
 
 if "api_key" not in st.session_state:
-    st.session_state.api_key = None
+    st.session_state.api_key = os.getenv("REVERB_API_KEY", "")
 
-def api_headers(api_key: str) -> dict:
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Accept-Version": "3.0",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+if "api_tested" not in st.session_state:
+    st.session_state.api_tested = False
 
-def get_shipping_profiles(api_key: str):
-    resp = requests.get(f"{API_BASE}/shop", headers=api_headers(api_key), timeout=30)
-    if resp.status_code != 200:
-        return None, f"Failed to fetch shop: {resp.status_code} - {resp.text}"
-    data = resp.json()
-    profiles = data.get("shipping_profiles", [])
-    return profiles, None
+with st.expander("Workflow analysis: API vs scraping vs limitations", expanded=False):
+    st.markdown(
+        """
+### A) Official API capabilities (best effort, account-permission dependent)
+- Validate API key and account access.
+- Create **draft** listings (`POST /listings`).
+- Set core listing fields (title, description, make/brand, model, price, condition, shipping profile, quantity, sku, location).
 
-def create_draft(api_key: str, payload: dict):
-    resp = requests.post(
-        f"{API_BASE}/listings",
-        headers=api_headers(api_key),
-        json=payload,
-        timeout=60,
+### B) Data that usually requires sold-page extraction
+- Sold item URLs, historical sold price, and page-level metadata.
+- Public listing description and image URLs.
+- Page specs that are not guaranteed in a single API response.
+
+### C) Things not fully reliable to automate end-to-end
+- Perfectly cloning every private/internal listing field.
+- Guaranteed image migration in one request for all seller accounts/API versions.
+- Category UUID inference from arbitrary text with 100% accuracy without extra mapping/endpoints.
+
+This app uses robust fallbacks: create draft first, include warnings for missing fields, and continue processing instead of failing silently.
+        """
     )
-    return resp
 
-# Page 1
-if st.session_state.api_key is None:
-    api = st.text_input("Enter Reverb API Key", type="password")
-    if st.button("Connect"):
-        st.session_state.api_key = api.strip()
-        st.rerun()
+page = st.sidebar.radio("Navigate", ["Settings", "Bulk Draft Creator"])
 
-# Page 2
+if page == "Settings":
+    st.subheader("API Settings")
+    st.caption("Your API key is stored in Streamlit session (and optional env/secrets), never hardcoded.")
+
+    api_key_input = st.text_input(
+        "Reverb API Key",
+        value=st.session_state.api_key,
+        type="password",
+        placeholder="REVERB_API_KEY",
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Save key", use_container_width=True):
+            st.session_state.api_key = api_key_input.strip()
+            st.session_state.api_tested = False
+            st.success("API key saved to current session.")
+    with c2:
+        if st.button("Test API key", use_container_width=True):
+            key = api_key_input.strip()
+            if not key:
+                st.error("Please provide an API key first.")
+            else:
+                client = ReverbAPIClient(key, logger)
+                ok, message = client.test_api_key()
+                st.session_state.api_tested = ok
+                if ok:
+                    st.success(message)
+                else:
+                    st.error(message)
+
 else:
-    st.subheader("Create Draft Listing")
+    st.subheader("Bulk Draft Creator")
+    if not st.session_state.api_key:
+        st.warning("Go to Settings first and save/test your API key.")
+        st.stop()
 
-    profiles, profile_error = get_shipping_profiles(st.session_state.api_key)
-
-    if profile_error:
-        st.error(profile_error)
-    else:
-        if profiles:
-            options = {
-                f'{p.get("name", "Profile")} ({p.get("id")})': str(p.get("id"))
-                for p in profiles
-            }
-            selected = st.selectbox("Shipping Profile", list(options.keys()))
-            shipping_profile_id = options[selected]
-        else:
-            shipping_profile_id = st.text_input("Shipping Profile ID")
-
-        title = st.text_input("Title")
-        make = st.text_input("Brand / Make")
-        model = st.text_input("Model")
-        description = st.text_area("Description")
-        price = st.number_input("Price USD", min_value=0.0, step=1.0, value=100.0)
-        discount_percent = st.number_input("Discount %", min_value=0, max_value=90, value=50)
-        condition_name = st.selectbox("Condition", list(CONDITIONS.keys()), index=0)
-        photos_text = st.text_area(
-            "Photo URLs (one per line)",
-            help="ضع كل رابط صورة في سطر"
+    with st.form("bulk_form"):
+        url_text = st.text_area(
+            "Sold Reverb URLs (one per line)",
+            height=220,
+            placeholder="https://reverb.com/item/94975758-fender-deluxe-reverb-1966-serviced?show_sold=true",
         )
 
-        if st.button("Create Draft"):
-            if not title or not make or not model:
-                st.error("Title, Make, and Model are required.")
-            else:
-                discounted = round(price * (1 - discount_percent / 100), 2)
-                photo_urls = [x.strip() for x in photos_text.splitlines() if x.strip()]
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            shipping_profile_id = st.text_input("Shipping profile ID", placeholder="114252")
+        with col2:
+            discount_percent = st.number_input("Discount %", min_value=0.0, max_value=95.0, value=15.0, step=0.5)
+        with col3:
+            inventory_qty = st.number_input("Default quantity", min_value=1, max_value=999, value=1, step=1)
+
+        col4, col5, col6 = st.columns(3)
+        with col4:
+            location = st.text_input("Location (optional)")
+        with col5:
+            sku_prefix = st.text_input("SKU prefix (optional)")
+        with col6:
+            trim_length = st.number_input("Trim description length (0 = off)", min_value=0, max_value=10000, value=0)
+
+        remove_special = st.checkbox("Remove emojis / unusual characters", value=False)
+        create_now = st.checkbox("Create drafts immediately", value=False)
+
+        submitted = st.form_submit_button("Start processing", use_container_width=True)
+
+    if submitted:
+        urls = parse_bulk_urls(url_text)
+        if not urls:
+            st.error("No valid Reverb item URLs found.")
+            st.stop()
+        if not shipping_profile_id.strip().isdigit():
+            st.error("Shipping profile ID must be numeric.")
+            st.stop()
+
+        client = ReverbAPIClient(st.session_state.api_key, logger)
+
+        progress_bar = st.progress(0)
+        status_placeholder = st.empty()
+        table_placeholder = st.empty()
+
+        results: list[ResultRow] = []
+        total = len(urls)
+
+        for idx, url in enumerate(urls, start=1):
+            status_placeholder.info(f"Processing {idx}/{total}: {url}")
+
+            try:
+                extracted = extract_listing_data(url, api_client=client)
+                price = Decimal(extracted.price_amount) if extracted.price_amount else None
+                if price is None:
+                    raise ValueError("Sold price unavailable after HTML + API fallback; cannot calculate discounted draft price.")
+                discounted = apply_discount(price, discount_percent)
+
+                title = sanitize_text(extracted.title, remove_special=remove_special, trim_length=160)
+                description = sanitize_text(
+                    extracted.description,
+                    remove_special=remove_special,
+                    trim_length=(trim_length if trim_length > 0 else None),
+                )
 
                 payload = {
                     "title": title,
-                    "make": make,
-                    "model": model,
                     "description": description or title,
-                    "price": {
-                        "amount": f"{discounted:.2f}",
-                        "currency": "USD",
-                    },
-                    "condition": {
-                        "uuid": CONDITIONS[condition_name]
-                    },
-                    "shipping_profile_id": int(shipping_profile_id) if shipping_profile_id else None,
-                    "photos": photo_urls,
+                    "price": {"amount": f"{discounted}", "currency": extracted.price_currency or "USD"},
+                    "shipping_profile_id": int(shipping_profile_id),
+                    "make": extracted.brand or "Unknown",
+                    "model": extracted.model or "Unknown",
+                    "condition": {"uuid": condition_to_uuid(extracted.condition)},
+                    "quantity": int(inventory_qty),
                 }
 
-                resp = create_draft(st.session_state.api_key, payload)
+                if location.strip():
+                    payload["location"] = sanitize_text(location, remove_special=remove_special, trim_length=80)
+                if sku_prefix.strip():
+                    payload["sku"] = f"{sanitize_text(sku_prefix, remove_special=True)}-{idx}"
+                if extracted.images:
+                    payload["photos"] = extracted.images
+                if extracted.category_uuid:
+                    payload["category_uuid"] = extracted.category_uuid
 
-                if resp.status_code in (200, 201):
-                    st.success("Draft created successfully.")
-                    st.code(json.dumps(resp.json(), indent=2), language="json")
+                warnings = list(extracted.warnings)
+                if extracted.specs:
+                    warnings.append(flatten_specs(extracted.specs))
+
+                if create_now:
+                    success, _response_json, action_message = client.create_draft(payload)
+                    if success:
+                        results.append(
+                            ResultRow(
+                                source_url=url,
+                                status="success",
+                                title=title,
+                                sold_price=f"{price} {extracted.price_currency}",
+                                discounted_price=f"{discounted} {extracted.price_currency}",
+                                action="draft created",
+                                warnings=" | ".join(warnings + ([action_message] if action_message else [])),
+                            )
+                        )
+                    else:
+                        results.append(
+                            ResultRow(
+                                source_url=url,
+                                status="failed",
+                                title=title,
+                                sold_price=f"{price} {extracted.price_currency}",
+                                discounted_price=f"{discounted} {extracted.price_currency}",
+                                action="failed",
+                                error=action_message,
+                                warnings=" | ".join(warnings),
+                            )
+                        )
                 else:
-                    st.error(f"Create failed: {resp.status_code}")
-                    st.code(resp.text)
+                    results.append(
+                        ResultRow(
+                            source_url=url,
+                            status="preview",
+                            title=title,
+                            sold_price=f"{price} {extracted.price_currency}",
+                            discounted_price=f"{discounted} {extracted.price_currency}",
+                            action="preview only",
+                            warnings=" | ".join(warnings),
+                        )
+                    )
+
+            except Exception as exc:
+                logger.exception("Failed processing URL: %s", url)
+                results.append(
+                    ResultRow(
+                        source_url=url,
+                        status="failed",
+                        action="failed",
+                        error=str(exc),
+                    )
+                )
+
+            progress_bar.progress(idx / total)
+            table_placeholder.dataframe(results_to_dataframe(results), use_container_width=True)
+
+        status_placeholder.success("Bulk run completed.")
+        report_df = results_to_dataframe(results)
+        st.markdown("### Final report")
+        st.dataframe(report_df, use_container_width=True)
+        st.download_button(
+            "Download CSV report",
+            data=dataframe_to_csv_bytes(report_df),
+            file_name="reverb_bulk_draft_report.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
