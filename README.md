@@ -1,13 +1,14 @@
 # Reverb Bulk Draft Creator (Streamlit)
 
-A practical Streamlit tool to generate Reverb **draft** listings from sold Reverb item URLs in bulk.
+A practical Streamlit tool to generate and manage Reverb drafts from sold Reverb item URLs.
 
 ## What this app does
 
 ### API-dependent (official Reverb API)
-- Validate API key (`/shop`) 
-- Create draft listings (`/listings`) 
-- Apply shipping profile ID, price, quantity, condition, and core fields
+- Validate API key (`/shop`)
+- Create draft listings (`/listings`)
+- Fetch your draft listings (best effort, endpoint/permission dependent)
+- Publish a draft by listing ID (best effort, endpoint/permission dependent)
 
 ### Scraping-dependent (public sold listing pages)
 - Extract title, description, image URLs, brand/model hints, and sold price (best effort)
@@ -19,14 +20,12 @@ A practical Streamlit tool to generate Reverb **draft** listings from sold Rever
 - Guaranteed image re-attachment for every account/API behavior
 - Automatic category UUID mapping for all categories without dedicated mapping endpoints/data
 
-The app implements safe fallbacks and logs warnings when fields are missing.
-
 ---
 
 ## Project structure
 
-- `app.py` – Streamlit UI with 2 pages (Settings, Bulk Draft Creator)
-- `reverb_api.py` – Reverb API client (auth test, draft creation, rate-limit handling)
+- `app.py` – Streamlit UI with 2 pages (`Settings`, `Draft Tools`)
+- `reverb_api.py` – Reverb API client (auth test, draft creation, draft fetch/publish, rate-limit handling)
 - `scraper.py` – Sold page extraction logic
 - `parser.py` – URL/item parsing + price/discount helpers
 - `utils.py` – sanitization, retry, logging, report helpers
@@ -85,13 +84,21 @@ LOG_LEVEL = "INFO"
 
 1. Open **Settings** page.
 2. Enter API key and click **Test API key**.
-3. Open **Bulk Draft Creator**.
-4. Paste sold URLs (1 per line), set shipping profile ID and discount.
-5. Optionally set quantity, location, SKU prefix, sanitization options.
-6. Choose:
-   - **Preview only** (unchecked create box), or
-   - **Create drafts immediately** (checked).
-7. Watch progress + final table; download CSV report.
+3. Open **Draft Tools** page.
+4. Choose action:
+   - **Publish New Drafts**: create drafts from sold URLs in bulk.
+   - **See My Drafts**: list current drafts and optionally publish a draft by ID.
+
+### Publish New Drafts mode
+1. Paste sold URLs (one per line).
+2. Enter shipping profile ID and discount.
+3. Optionally set quantity, location, and SKU prefix.
+4. Click **Publish New Drafts**.
+5. Watch per-item lifecycle (`pending`, `processing`, `success`/`failed`) and download CSV report.
+
+### See My Drafts mode
+1. Click **Refresh My Drafts** to fetch drafts.
+2. Optionally enter a draft ID and click **Publish Draft**.
 
 ---
 
@@ -100,3 +107,4 @@ LOG_LEVEL = "INFO"
 - If sold price is missing even after API fallback, draft creation for that URL is skipped with an error row.
 - If photos fail during API create, app retries without photos and reports warning.
 - Category UUID may be unavailable from page data; app proceeds and flags warning.
+- Some seller accounts may not have permission for draft-list or draft-publish endpoints.
