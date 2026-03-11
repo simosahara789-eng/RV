@@ -89,6 +89,46 @@ class ReverbAPIClient:
             return True, resp.json(), ""
         return False, {}, f"Listing lookup failed ({resp.status_code}): {resp.text[:300]}"
 
+    def _extract_listing_rows(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if isinstance(payload.get("listings"), list):
+            return payload["listings"]
+        embedded = payload.get("_embedded", {})
+        if isinstance(embedded, dict) and isinstance(embedded.get("listings"), list):
+            return embedded["listings"]
+        if isinstance(payload.get("data"), list):
+            return payload["data"]
+        return []
+
+    def get_my_drafts(self, per_page: int = 50) -> tuple[bool, list[dict[str, Any]], str]:
+        """Best-effort fetch for account draft listings."""
+        endpoints = [
+            f"/my/listings?state=draft&per_page={per_page}",
+            f"/my/listings?status=draft&per_page={per_page}",
+            f"/listings/my?state=draft&per_page={per_page}",
+        ]
+        last_error = ""
+        for endpoint in endpoints:
+            resp = self._request("GET", endpoint)
+            if resp.status_code == 200:
+                rows = self._extract_listing_rows(resp.json())
+                return True, rows, ""
+            last_error = f"{endpoint} -> {resp.status_code}: {resp.text[:180]}"
+        return False, [], f"Unable to fetch drafts. {last_error}"
+
+    def publish_draft(self, listing_id: str) -> tuple[bool, str]:
+        """Best-effort publish call for an existing draft listing."""
+        endpoints = [
+            f"/listings/{listing_id}/publish",
+            f"/my/listings/{listing_id}/publish",
+        ]
+        last_error = ""
+        for endpoint in endpoints:
+            resp = self._request("POST", endpoint)
+            if resp.status_code in {200, 201}:
+                return True, f"Draft {listing_id} published."
+            last_error = f"{endpoint} -> {resp.status_code}: {resp.text[:200]}"
+        return False, f"Publish failed for draft {listing_id}. {last_error}"
+
     def create_draft(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str]:
         """Create draft listing. If image urls fail, retry without photos."""
         resp = self._request("POST", "/listings", json=payload)

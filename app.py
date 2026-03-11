@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from decimal import Decimal
 
+import pandas as pd
 import streamlit as st
 
 from parser import apply_discount, flatten_specs
@@ -36,7 +37,8 @@ with st.expander("Workflow analysis: API vs scraping vs limitations", expanded=F
 ### A) Official API capabilities (best effort, account-permission dependent)
 - Validate API key and account access.
 - Create **draft** listings (`POST /listings`).
-- Set core listing fields (title, description, make/brand, model, price, condition, shipping profile, quantity, sku, location).
+- List your drafts (best effort; endpoint availability depends on account/API permissions).
+- Publish a chosen draft by ID (best effort; endpoint availability depends on account/API permissions).
 
 ### B) Data that usually requires sold-page extraction
 - Sold item URLs, historical sold price, and page-level metadata.
@@ -47,12 +49,10 @@ with st.expander("Workflow analysis: API vs scraping vs limitations", expanded=F
 - Perfectly cloning every private/internal listing field.
 - Guaranteed image migration in one request for all seller accounts/API versions.
 - Category UUID inference from arbitrary text with 100% accuracy without extra mapping/endpoints.
-
-This app uses robust fallbacks: create draft first, include warnings for missing fields, and continue processing instead of failing silently.
         """
     )
 
-page = st.sidebar.radio("Navigate", ["Settings", "Bulk Draft Creator"])
+page = st.sidebar.radio("Navigate", ["Settings", "Draft Tools"])
 
 if page == "Settings":
     st.subheader("API Settings")
@@ -86,106 +86,134 @@ if page == "Settings":
                     st.error(message)
 
 else:
-    st.subheader("Bulk Draft Creator")
+    st.subheader("Draft Tools")
     if not st.session_state.api_key:
         st.warning("Go to Settings first and save/test your API key.")
         st.stop()
 
-    with st.form("bulk_form"):
-        url_text = st.text_area(
-            "Sold Reverb URLs (one per line)",
-            height=220,
-            placeholder="https://reverb.com/item/94975758-fender-deluxe-reverb-1966-serviced?show_sold=true",
-        )
+    client = ReverbAPIClient(st.session_state.api_key, logger)
+    mode = st.radio("Choose action", ["Publish New Drafts", "See My Drafts"], horizontal=True)
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            shipping_profile_id = st.text_input("Shipping profile ID", placeholder="114252")
-        with col2:
-            discount_percent = st.number_input("Discount %", min_value=0.0, max_value=95.0, value=15.0, step=0.5)
-        with col3:
-            inventory_qty = st.number_input("Default quantity", min_value=1, max_value=999, value=1, step=1)
+    if mode == "See My Drafts":
+        st.markdown("### My draft listings")
+        if st.button("Refresh My Drafts", use_container_width=True):
+            ok, drafts, message = client.get_my_drafts()
+            if not ok:
+                st.error(message)
+            else:
+                rows = []
+                for draft in drafts:
+                    price_obj = draft.get("price", {}) if isinstance(draft.get("price"), dict) else {}
+                    rows.append(
+                        {
+                            "draft_id": draft.get("id", ""),
+                            "title": draft.get("title", ""),
+                            "status": draft.get("state") or draft.get("status") or "draft",
+                            "price": f"{price_obj.get('amount', '')} {price_obj.get('currency', '')}".strip(),
+                            "updated_at": draft.get("updated_at", ""),
+                            "url": draft.get("_links", {}).get("web", {}).get("href", ""),
+                        }
+                    )
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-        col4, col5, col6 = st.columns(3)
-        with col4:
-            location = st.text_input("Location (optional)")
-        with col5:
-            sku_prefix = st.text_input("SKU prefix (optional)")
-        with col6:
-            trim_length = st.number_input("Trim description length (0 = off)", min_value=0, max_value=10000, value=0)
+        st.markdown("### Publish a draft by ID")
+        draft_id = st.text_input("Draft ID")
+        if st.button("Publish Draft", use_container_width=True):
+            if not draft_id.strip():
+                st.error("Enter a draft ID first.")
+            else:
+                ok, message = client.publish_draft(draft_id.strip())
+                if ok:
+                    st.success(message)
+                else:
+                    st.error(message)
 
-        remove_special = st.checkbox("Remove emojis / unusual characters", value=False)
-        create_now = st.checkbox("Create drafts immediately", value=False)
+    else:
+        with st.form("bulk_form"):
+            url_text = st.text_area(
+                "Sold Reverb URLs (one per line)",
+                height=220,
+                placeholder="https://reverb.com/item/94975758-fender-deluxe-reverb-1966-serviced?show_sold=true",
+            )
 
-        submitted = st.form_submit_button("Start processing", use_container_width=True)
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                shipping_profile_id = st.text_input("Shipping profile ID", placeholder="114252")
+            with col2:
+                discount_percent = st.number_input("Discount %", min_value=0.0, max_value=95.0, value=15.0, step=0.5)
+            with col3:
+                inventory_qty = st.number_input("Default quantity", min_value=1, max_value=999, value=1, step=1)
 
-    if submitted:
-        urls = parse_bulk_urls(url_text)
-        if not urls:
-            st.error("No valid Reverb item URLs found.")
-            st.stop()
-        if not shipping_profile_id.strip().isdigit():
-            st.error("Shipping profile ID must be numeric.")
-            st.stop()
+            col4, col5 = st.columns(2)
+            with col4:
+                location = st.text_input("Location (optional)")
+            with col5:
+                sku_prefix = st.text_input("SKU prefix (optional)")
 
-        client = ReverbAPIClient(st.session_state.api_key, logger)
+            submitted = st.form_submit_button("Publish New Drafts", use_container_width=True)
 
-        progress_bar = st.progress(0)
-        status_placeholder = st.empty()
-        table_placeholder = st.empty()
+        if submitted:
+            urls = parse_bulk_urls(url_text)
+            if not urls:
+                st.error("No valid Reverb item URLs found.")
+                st.stop()
+            if not shipping_profile_id.strip().isdigit():
+                st.error("Shipping profile ID must be numeric.")
+                st.stop()
 
-        results: list[ResultRow] = [
-            ResultRow(source_url=source_url, status="pending", action="pending") for source_url in urls
-        ]
-        total = len(urls)
+            progress_bar = st.progress(0)
+            status_placeholder = st.empty()
+            table_placeholder = st.empty()
 
-        for idx, url in enumerate(urls, start=1):
-            status_placeholder.info(f"Processing {idx}/{total}: {url}")
-            row = results[idx - 1]
-            row.status = "processing"
-            row.action = "processing"
-            table_placeholder.dataframe(results_to_dataframe(results), use_container_width=True)
+            results: list[ResultRow] = [
+                ResultRow(source_url=source_url, status="pending", action="pending") for source_url in urls
+            ]
+            total = len(urls)
 
-            try:
-                extracted = extract_listing_data(url, api_client=client)
-                price = Decimal(extracted.price_amount) if extracted.price_amount else None
-                if price is None:
-                    raise ValueError("Sold price unavailable after HTML + API fallback; cannot calculate discounted draft price.")
-                discounted = apply_discount(price, discount_percent)
-                display_currency = extracted.price_currency or "USD"
+            for idx, url in enumerate(urls, start=1):
+                status_placeholder.info(f"Processing {idx}/{total}: {url}")
+                row = results[idx - 1]
+                row.status = "processing"
+                row.action = "processing"
+                table_placeholder.dataframe(results_to_dataframe(results), use_container_width=True)
 
-                title = sanitize_text(extracted.title, remove_special=remove_special, trim_length=160)
-                description = sanitize_text(
-                    extracted.description,
-                    remove_special=remove_special,
-                    trim_length=(trim_length if trim_length > 0 else None),
-                )
+                try:
+                    extracted = extract_listing_data(url, api_client=client)
+                    price = Decimal(extracted.price_amount) if extracted.price_amount else None
+                    if price is None:
+                        raise ValueError(
+                            "Sold price unavailable after HTML + API fallback; cannot calculate discounted draft price."
+                        )
+                    discounted = apply_discount(price, discount_percent)
+                    display_currency = extracted.price_currency or "USD"
 
-                payload = {
-                    "title": title,
-                    "description": description or title,
-                    "price": {"amount": f"{discounted}", "currency": extracted.price_currency or "USD"},
-                    "shipping_profile_id": int(shipping_profile_id),
-                    "make": extracted.brand or "Unknown",
-                    "model": extracted.model or "Unknown",
-                    "condition": {"uuid": condition_to_uuid(extracted.condition)},
-                    "quantity": int(inventory_qty),
-                }
+                    title = sanitize_text(extracted.title, remove_special=False, trim_length=160)
+                    description = sanitize_text(extracted.description, remove_special=False, trim_length=None)
 
-                if location.strip():
-                    payload["location"] = sanitize_text(location, remove_special=remove_special, trim_length=80)
-                if sku_prefix.strip():
-                    payload["sku"] = f"{sanitize_text(sku_prefix, remove_special=True)}-{idx}"
-                if extracted.images:
-                    payload["photos"] = extracted.images
-                if extracted.category_uuid:
-                    payload["category_uuid"] = extracted.category_uuid
+                    payload = {
+                        "title": title,
+                        "description": description or title,
+                        "price": {"amount": f"{discounted}", "currency": display_currency},
+                        "shipping_profile_id": int(shipping_profile_id),
+                        "make": extracted.brand or "Unknown",
+                        "model": extracted.model or "Unknown",
+                        "condition": {"uuid": condition_to_uuid(extracted.condition)},
+                        "quantity": int(inventory_qty),
+                    }
 
-                warnings = list(extracted.warnings)
-                if extracted.specs:
-                    warnings.append(flatten_specs(extracted.specs))
+                    if location.strip():
+                        payload["location"] = sanitize_text(location, remove_special=False, trim_length=80)
+                    if sku_prefix.strip():
+                        payload["sku"] = f"{sanitize_text(sku_prefix, remove_special=True)}-{idx}"
+                    if extracted.images:
+                        payload["photos"] = extracted.images
+                    if extracted.category_uuid:
+                        payload["category_uuid"] = extracted.category_uuid
 
-                if create_now:
+                    warnings = list(extracted.warnings)
+                    if extracted.specs:
+                        warnings.append(flatten_specs(extracted.specs))
+
                     success, _response_json, action_message = client.create_draft(payload)
                     if success:
                         row.status = "success"
@@ -202,31 +230,23 @@ else:
                         row.action = "failed"
                         row.error = action_message
                         row.warnings = " | ".join(warnings)
-                else:
-                    row.status = "preview"
-                    row.title = title
-                    row.sold_price = f"{price} {display_currency}"
-                    row.discounted_price = f"{discounted} {display_currency}"
-                    row.action = "preview only"
-                    row.warnings = " | ".join(warnings)
 
-            except Exception as exc:
-                logger.exception("Failed processing URL: %s", url)
-                row.status = "failed"
-                row.action = "failed"
-                row.error = str(exc)
+                except Exception as exc:
+                    logger.exception("Failed processing URL: %s", url)
+                    row.status = "failed"
+                    row.action = "failed"
+                    row.error = str(exc)
 
-            progress_bar.progress(idx / total)
-            table_placeholder.dataframe(results_to_dataframe(results), use_container_width=True)
+                progress_bar.progress(idx / total)
+                table_placeholder.dataframe(results_to_dataframe(results), use_container_width=True)
 
-        status_placeholder.success("Bulk run completed.")
-        report_df = results_to_dataframe(results)
-        st.markdown("### Final report")
-        st.dataframe(report_df, use_container_width=True)
-        st.download_button(
-            "Download CSV report",
-            data=dataframe_to_csv_bytes(report_df),
-            file_name="reverb_bulk_draft_report.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+            status_placeholder.success("Bulk run completed.")
+            st.markdown("### Final report")
+            report_df = results_to_dataframe(results)
+            st.download_button(
+                "Download CSV report",
+                data=dataframe_to_csv_bytes(report_df),
+                file_name="reverb_bulk_draft_report.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
