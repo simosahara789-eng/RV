@@ -1,2 +1,5 @@
-streamlit
-requests
+streamlit>=1.32
+requests>=2.31
+beautifulsoup4>=4.12
+pandas>=2.0
+python-dotenv>=1.0
